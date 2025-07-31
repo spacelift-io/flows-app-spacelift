@@ -1,4 +1,4 @@
-import { defineApp, http, kv, blocks, messaging } from "@slflows/sdk/v1";
+import { defineApp, http, kv, messaging } from "@slflows/sdk/v1";
 import { createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import { executeSpaceliftQuery, extractCredentials } from "./client";
 import { webhook } from "./blocks/stacks/webhook";
@@ -19,7 +19,7 @@ import { simulatePolicy } from "./blocks/policies/simulatePolicy";
 import { getPolicyEvaluations } from "./blocks/policies/getPolicyEvaluations";
 import { attachPolicyToStack } from "./blocks/policies/attachPolicyToStack";
 import { detachPolicyFromStack } from "./blocks/policies/detachPolicyFromStack";
-import { markExternalDependency } from "./blocks/external/markExternalDependency";
+import { markExternalDependency } from "./blocks/dependencies/markExternalDependency";
 import { createContext } from "./blocks/contexts/createContext";
 import { updateContext } from "./blocks/contexts/updateContext";
 import { contextResource } from "./blocks/contexts/contextResource";
@@ -61,6 +61,7 @@ export const app = defineApp({
       description: "Your Spacelift API key secret",
       type: "string",
       required: true,
+      sensitive: true,
     },
     endpoint: {
       name: "Spacelift Endpoint",
@@ -75,6 +76,23 @@ export const app = defineApp({
         "The Spacelift space where notification policy and webhook will be created",
       type: "string",
       required: true,
+    },
+  },
+  signals: {
+    webhookId: {
+      name: "Webhook ID",
+      description:
+        "The ID of the managed Spacelift webhook used for receiving notifications",
+    },
+    webhookSecret: {
+      name: "Webhook Secret",
+      description: "The secret used to verify Spacelift webhook requests",
+      sensitive: true,
+    },
+    notificationPolicyId: {
+      name: "Notification Policy ID",
+      description:
+        "The ID of the managed Spacelift notification policy used for routing events to Flows",
     },
   },
   blocks: {
@@ -142,68 +160,74 @@ export const app = defineApp({
       const { request } = input;
       const signature256 = request.headers["X-Signature-256"];
 
-      if (request.method === "POST" && signature256) {
-        const webhookPayload = request.body;
-
-        try {
-          const webhook = await kv.app.get("webhook");
-
-          if (!webhook?.value?.secret) {
-            await http.respond(request.requestId, {
-              statusCode: 500,
-              body: { error: "Internal server error" },
-            });
-            return;
-          }
-
-          const expectedSignature =
-            "sha256=" +
-            createHmac("sha256", webhook.value.secret)
-              .update(request.rawBody)
-              .digest("hex");
-
-          const providedSignature = Buffer.from(signature256);
-          const computedSignature = Buffer.from(expectedSignature);
-
-          if (!timingSafeEqual(providedSignature, computedSignature)) {
-            await http.respond(request.requestId, {
-              statusCode: 401,
-              body: { error: "Invalid webhook signature" },
-            });
-            return;
-          }
-        } catch (error) {
-          await http.respond(request.requestId, {
-            statusCode: 500,
-            body: { error: "Internal server error" },
-          });
-          return;
-        }
-
+      if (request.method !== "POST" || !signature256) {
         await http.respond(request.requestId, {
-          statusCode: 200,
-          body: { message: "Webhook received" },
+          statusCode: 400,
+          body: { error: "Invalid request" },
         });
-
-        const listOutput = await blocks.list({
-          typeIds: ["triggerRun", "performTask"],
-        });
-
-        if (listOutput.blocks.length > 0) {
-          await messaging.sendToBlocks({
-            body: {
-              payload: webhookPayload,
-            },
-            blockIds: listOutput.blocks.map((block) => block.id),
-          });
-        }
 
         return;
       }
 
+      const webhookPayload = request.body;
+
+      try {
+        const webhookSecret = input.app.signals.webhookSecret;
+
+        if (!webhookSecret) {
+          console.log("No webhook secret configured");
+
+          await http.respond(request.requestId, {
+            statusCode: 400,
+            body: { error: "No webhook secret configured" },
+          });
+          return;
+        }
+
+        const expectedSignature =
+          "sha256=" +
+          createHmac("sha256", webhookSecret)
+            .update(request.rawBody)
+            .digest("hex");
+
+        const providedSignature = Buffer.from(signature256);
+        const computedSignature = Buffer.from(expectedSignature);
+
+        if (!timingSafeEqual(providedSignature, computedSignature)) {
+          await http.respond(request.requestId, {
+            statusCode: 401,
+            body: { error: "Invalid webhook signature" },
+          });
+          return;
+        }
+      } catch (error) {
+        console.error("Error verifying webhook signature:", error);
+
+        await http.respond(request.requestId, {
+          statusCode: 500,
+          body: { error: "Internal server error" },
+        });
+        return;
+      }
+
       await http.respond(request.requestId, {
-        statusCode: 400,
-        body: { error: "Invalid request" },
+        statusCode: 200,
+        body: { message: "Webhook received" },
+      });
+
+      const { value } = await kv.app.get(`run:${webhookPayload.run.id}`);
+      if (!value) {
+        return;
+      }
+
+      const { blockId, pendingEventId, parentEventId } = value;
+      await messaging.sendToBlocks({
+        body: {
+          payload: webhookPayload,
+          pendingEventId,
+          parentEventId,
+        },
+        blockIds: [blockId],
       });
     },
   },
@@ -217,142 +241,48 @@ export const app = defineApp({
       };
     }
 
+    const signalUpdates: Record<string, any> = {};
+    let { webhookId, notificationPolicyId } = input.app.signals;
+
     try {
       const credentials = extractCredentials(input.app.config);
 
-      const [existingWebhook, existingPolicyId] = await kv.app.getMany([
-        "webhook",
-        "notificationPolicyId",
-      ]);
-
-      let webhook = existingWebhook?.value;
-      let policyId = existingPolicyId?.value;
-
-      if (webhook?.id) {
-        try {
-          const webhookResult = await executeSpaceliftQuery(
-            credentials,
-            `
-              query GetNamedWebhook($id: ID!) {
-                namedWebhooksIntegration(id: $id) {
-                  id
-                  enabled
-                  endpoint
-                  space {
-                    id
-                  }
-                }
-              }
-            `,
-            { id: webhook.id },
-          );
-
-          if (!webhookResult.namedWebhooksIntegration) {
-            webhook = null;
-            await kv.app.delete(["webhook"]);
-          } else {
-            const readableWebhookName = `Flows Webhook (${input.app.installationUrl})`;
-
-            await executeSpaceliftQuery(
-              credentials,
-              `
-                mutation UpdateNamedWebhook($id: ID!, $input: NamedWebhooksIntegrationInput!) {
-                  namedWebhooksIntegrationUpdate(id: $id, input: $input) {
-                    id
-                    name
-                  }
-                }
-              `,
-              {
-                id: webhook.id,
-                input: {
-                  space: spaceId,
-                  name: readableWebhookName,
-                  endpoint: input.app.http.url,
-                  enabled: true,
-                  labels: ["flows"],
-                  secret: webhook.secret,
-                },
-              },
-            );
-          }
-        } catch {
-          webhook = null;
-          await kv.app.delete(["webhook"]);
-        }
-      }
-
-      if (!webhook) {
-        const uniqueWebhookName = `flows-${crypto.randomUUID()}`;
-        const readableWebhookName = `Flows Webhook (${input.app.installationUrl})`;
-
+      if (!webhookId) {
         const webhookSecret = randomBytes(32).toString("hex");
 
-        try {
-          const webhookResult = await executeSpaceliftQuery(
-            credentials,
-            `
-              mutation CreateNamedWebhook($input: NamedWebhooksIntegrationInput!) {
-                namedWebhooksIntegrationCreate(input: $input) {
-                  id
-                  name
-                  endpoint
-                  enabled
-                }
+        const webhookResult = await executeSpaceliftQuery(
+          credentials,
+          `
+          mutation CreateNamedWebhook($input: NamedWebhooksIntegrationInput!) {
+            namedWebhooksIntegrationCreate(input: $input) {
+              id
+              name
+              endpoint
+              enabled
               }
-            `,
-            {
-              input: {
-                space: spaceId,
-                name: uniqueWebhookName,
-                endpoint: input.app.http.url,
-                enabled: true,
-                labels: ["flows"],
-                secret: webhookSecret,
-              },
-            },
-          );
-
-          const webhookId = webhookResult.namedWebhooksIntegrationCreate.id;
-
-          await executeSpaceliftQuery(
-            credentials,
-            `
-              mutation UpdateNamedWebhook($id: ID!, $input: NamedWebhooksIntegrationInput!) {
-                namedWebhooksIntegrationUpdate(id: $id, input: $input) {
-                  id
-                  name
-                }
               }
-            `,
-            {
-              id: webhookId,
-              input: {
-                space: spaceId,
-                name: readableWebhookName,
-                endpoint: input.app.http.url,
-                enabled: true,
-                labels: ["flows"],
-                secret: webhookSecret,
-              },
+              `,
+          {
+            input: {
+              space: spaceId,
+              name: `Flows Webhook (${input.app.installationUrl})`,
+              endpoint: input.app.http.url,
+              enabled: true,
+              labels: ["flows"],
+              secret: webhookSecret,
             },
-          );
+          },
+        );
 
-          webhook = { id: webhookId, secret: webhookSecret };
-          await kv.app.set({ key: "webhook", value: webhook });
-        } catch {
-          return {
-            newStatus: "failed",
-            customStatusDescription: `Failed to create webhook`,
-          };
-        }
+        webhookId = webhookResult.namedWebhooksIntegrationCreate.id;
+        signalUpdates.webhookSecret = webhookSecret;
+        signalUpdates.webhookId = webhookId;
       }
 
-      if (!policyId) {
-        try {
-          const policyResult = await executeSpaceliftQuery(
-            credentials,
-            `
+      if (!notificationPolicyId) {
+        const policyResult = await executeSpaceliftQuery(
+          credentials,
+          `
               mutation CreatePolicy($input: PolicyCreateInput!) {
                 policyCreatev2(input: $input) {
                   id
@@ -362,42 +292,36 @@ export const app = defineApp({
                 }
               }
             `,
-            {
-              input: {
-                name: `Flows Notification Policy (${input.app.installationUrl})`,
-                body: `package spacelift
+          {
+            input: {
+              name: `Flows Notification Policy (${input.app.installationUrl})`,
+              body: `package spacelift
 
 # Default notification policy that routes all notifications to Flows webhook
 webhook[{"endpoint_id": endpoint.id}] {
   endpoint := input.webhook_endpoints[_]
-  endpoint.id == "${webhook.id}"
+  endpoint.id == "${webhookId}"
 }`,
-                type: "NOTIFICATION",
-                space: spaceId,
-                labels: ["flows"],
-                description:
-                  "Notification policy for routing Spacelift events to Flows webhook",
-              },
+              type: "NOTIFICATION",
+              space: spaceId,
+              labels: ["flows"],
+              description:
+                "Notification policy for routing Spacelift events to Flows webhook",
             },
-          );
+          },
+        );
 
-          await kv.app.set({
-            key: "notificationPolicyId",
-            value: policyResult.policyCreatev2.id,
-          });
-        } catch {
-          return {
-            newStatus: "failed",
-            customStatusDescription: `Failed to create notification policy`,
-          };
-        }
+        signalUpdates.notificationPolicyId = policyResult.policyCreatev2.id;
       }
 
-      return { newStatus: "ready" };
+      return { newStatus: "ready", signalUpdates };
     } catch (error) {
+      console.error("Error during sync:", error);
+
       return {
         newStatus: "failed",
-        customStatusDescription: `Setup failed`,
+        signalUpdates,
+        customStatusDescription: `Setup failed, see logs`,
       };
     }
   },

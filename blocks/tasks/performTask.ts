@@ -81,80 +81,42 @@ export const performTask: AppBlock = {
           statusDescription: `Task ${result.taskCreate.id} started`,
         });
 
-        await kv.block.set({
-          key: `task:${result.taskCreate.id}`,
+        await kv.app.set({
+          key: `run:${result.taskCreate.id}`,
           value: {
-            taskId: result.taskCreate.id,
-            stackId: variables.stack,
-            command: result.taskCreate.command,
-            pendingEventId: pendingEventId,
+            blockId: input.block.id,
             parentEventId: input.event.id,
-            createdAt: Date.now(),
-          },
-        });
-
-        await kv.block.set({
-          key: `pending:${pendingEventId}`,
-          value: {
             pendingEventId,
-            taskId: result.taskCreate.id,
-            createdAt: Date.now(),
           },
         });
       },
     },
   },
   onInternalMessage: async (input) => {
-    const webhookPayload = input.message.body.payload;
+    const { parentEventId, payload, pendingEventId } = input.message.body;
 
-    if (!webhookPayload?.run || webhookPayload.run.type !== "TASK") {
+    if (!payload?.run) {
       return;
     }
 
-    const { run, stack, state, stateVersion, account } = webhookPayload;
-
-    const trackedTask = await kv.block.get(`task:${run.id}`);
-    if (!trackedTask.value) {
-      return;
-    }
-
-    const pendingEventId = trackedTask.value.pendingEventId;
+    const { run, stack, state, stateVersion, account } = payload;
 
     await events.updatePending(pendingEventId, {
       statusDescription: `Task ${run.id} is ${state.toLowerCase()}`,
     });
 
     await events.emit(
-      {
-        run,
-        stack,
-        state,
-        stateVersion,
-        account,
-      },
-      {
-        outputKey: "stateChanged",
-        parentEventId: trackedTask.value.parentEventId,
-      },
+      { run, stack, state, stateVersion, account },
+      { outputKey: "stateChanged", parentEventId },
     );
 
     if (TERMINAL_STATES.includes(state)) {
       await events.emit(
-        {
-          run,
-          stack,
-          state,
-          stateVersion,
-          account,
-        },
-        {
-          outputKey: "completed",
-          complete: pendingEventId,
-          parentEventId: trackedTask.value.parentEventId,
-        },
+        { run, stack, state, stateVersion, account },
+        { outputKey: "completed", complete: pendingEventId, parentEventId },
       );
 
-      await kv.block.delete([`pending:${pendingEventId}`, `task:${run.id}`]);
+      await kv.app.delete([`task:${run.id}`]);
     }
   },
   schedules: {
