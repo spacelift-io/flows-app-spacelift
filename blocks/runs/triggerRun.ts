@@ -77,79 +77,42 @@ export const triggerRun: AppBlock = {
           statusDescription: `Run ${result.runTrigger.id} started`,
         });
 
-        await kv.block.set({
+        await kv.app.set({
           key: `run:${result.runTrigger.id}`,
           value: {
-            runId: result.runTrigger.id,
-            stackId: variables.stack,
-            pendingEventId: pendingEventId,
+            blockId: input.block.id,
             parentEventId: input.event.id,
-            createdAt: Date.now(),
-          },
-        });
-
-        await kv.block.set({
-          key: `pending:${pendingEventId}`,
-          value: {
             pendingEventId,
-            runId: result.runTrigger.id,
-            createdAt: Date.now(),
           },
         });
       },
     },
   },
   onInternalMessage: async (input) => {
-    const webhookPayload = input.message.body.payload;
+    const { parentEventId, payload, pendingEventId } = input.message.body;
 
-    if (!webhookPayload?.run) {
+    if (!payload?.run) {
       return;
     }
 
-    const { run, stack, state, stateVersion, account } = webhookPayload;
-
-    const trackedRun = await kv.block.get(`run:${run.id}`);
-    if (!trackedRun.value) {
-      return;
-    }
-
-    const pendingEventId = trackedRun.value.pendingEventId;
+    const { run, stack, state, stateVersion, account } = payload;
 
     await events.updatePending(pendingEventId, {
       statusDescription: `Run ${run.id} is ${state.toLowerCase()}`,
     });
 
     await events.emit(
-      {
-        run,
-        stack,
-        state,
-        stateVersion,
-        account,
-      },
-      {
-        outputKey: "stateChanged",
-        parentEventId: trackedRun.value.parentEventId,
-      },
+      { run, stack, state, stateVersion, account },
+      { outputKey: "stateChanged", parentEventId },
     );
 
     if (TERMINAL_STATES.includes(state)) {
       await events.emit(
-        {
-          run,
-          stack,
-          state,
-          stateVersion,
-          account,
-        },
-        {
-          outputKey: "completed",
-          complete: pendingEventId,
-          parentEventId: trackedRun.value.parentEventId,
-        },
+        { run, stack, state, stateVersion, account },
+        { outputKey: "completed", complete: pendingEventId, parentEventId },
       );
 
-      await kv.block.delete([`pending:${pendingEventId}`, `run:${run.id}`]);
+      await kv.app.delete([`run:${run.id}`]);
     }
   },
   schedules: {

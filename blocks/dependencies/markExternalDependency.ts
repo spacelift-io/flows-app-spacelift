@@ -12,7 +12,7 @@ const MARK_EXTERNAL_DEPENDENCY_COMPLETED_MUTATION = `
 export const markExternalDependency: AppBlock = {
   name: "Mark external dependency",
   description: "Mark an external dependency as finished or failed.",
-  category: "External",
+  category: "Dependencies",
   inputs: {
     default: {
       config: {
