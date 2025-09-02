@@ -1,4 +1,4 @@
-import { defineApp, http, kv, messaging } from "@slflows/sdk/v1";
+import { defineApp, http, kv, messaging, blocks } from "@slflows/sdk/v1";
 import { createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import { executeSpaceliftQuery, extractCredentials } from "./client";
 import { webhook } from "./blocks/stacks/webhook";
@@ -43,6 +43,7 @@ import { approveRun } from "./blocks/runs/approveRun";
 import { rejectRun } from "./blocks/runs/rejectRun";
 import { promoteRun } from "./blocks/runs/promoteRun";
 import { triggerRun } from "./blocks/runs/triggerRun";
+import { onRunStateChange } from "./blocks/runs/subscribeToRunEvents";
 import { performTask } from "./blocks/tasks/performTask";
 
 export const app = defineApp({
@@ -142,6 +143,7 @@ export const app = defineApp({
     triggerRun,
     getRun,
     getRunLogs,
+    onRunStateChange,
 
     // Stack operations
     getStack,
@@ -215,20 +217,31 @@ export const app = defineApp({
         body: { message: "Webhook received" },
       });
 
-      const { value } = await kv.app.get(`run:${webhookPayload.run.id}`);
-      if (!value) {
-        return;
+      if (webhookPayload.run && webhookPayload.stack) {
+        const subscriptionBlocks = await blocks.list({
+          typeIds: ["onRunStateChange"],
+        });
+
+        await messaging.sendToBlocks({
+          body: {
+            payload: webhookPayload,
+          },
+          blockIds: subscriptionBlocks.blocks.map((block) => block.id),
+        });
       }
 
-      const { blockId, pendingEventId, parentEventId } = value;
-      await messaging.sendToBlocks({
-        body: {
-          payload: webhookPayload,
-          pendingEventId,
-          parentEventId,
-        },
-        blockIds: [blockId],
-      });
+      const { value } = await kv.app.get(`run:${webhookPayload.run.id}`);
+      if (value) {
+        const { blockId, pendingEventId, parentEventId } = value;
+        await messaging.sendToBlocks({
+          body: {
+            payload: webhookPayload,
+            pendingEventId,
+            parentEventId,
+          },
+          blockIds: [blockId],
+        });
+      }
     },
   },
   async onSync(input) {
